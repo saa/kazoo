@@ -46,7 +46,6 @@
 
 -export([handle/2]).
 
-
 %%--------------------------------------------------------------------
 %% @public
 %% @doc
@@ -60,64 +59,37 @@ handle(Data, Call) ->
     InterceptType = wh_json:get_value(<<"type">>, Data),
     case build_intercept_params(Number, InterceptType, Call) of
         {'ok', Params} ->
-            case make_secure_params(Data) of
-                [] ->
-                    case maybe_allowed_to_intercept(Call, Params) of
-                        'true' ->
-                            cf_intercept:handle(wh_json:from_list(Params), Call);
-                        'false' ->
-                            no_permission_to_intercept(Call),
-                            cf_exe:stop(Call)
-                    end;
-                SParams ->
-                    cf_intercept:handle(wh_json:from_list(SParams ++ Params), Call)
-            end;
+            maybe_build_secure_params(Call, Params, make_secure_params(Data));
         {'error', _E} ->
-            lager:info("Error <<~s>> processing intercept '~s' for number ~s"
+            lager:info("error <<~s>> processing intercept '~s' for number ~s"
                        ,[_E, InterceptType, Number]),
             _ = whapps_call_command:b_play(<<"park-no_caller">>, Call),
             cf_exe:stop(Call)
     end.
 
+-spec maybe_build_secure_params(whapps_call:call(), wh_proplist(), wh_proplist()) -> any().
+maybe_build_secure_params(Call, Params, []) ->
+    case cf_intercept:maybe_allowed_to_intercept(Call, Params) of
+        'true' ->
+            cf_intercept:handle(wh_json:from_list(Params), Call);
+        'false' ->
+            cf_intercept:play_no_permission_to_intercept(Call),
+            cf_exe:stop(Call)
+    end;
+maybe_build_secure_params(Call, Params, SParams) ->
+    cf_intercept:handle(wh_json:from_list(SParams ++ Params), Call).
+
 -spec make_secure_params(wh_json:object()) -> wh_proplist().
 make_secure_params(Data) ->
-    SecureParams = [
-      {<<"approved_device_id">>, wh_json:get_value(<<"approved_device_id">>, Data)},
-      {<<"approved_user_id">>, wh_json:get_value(<<"approved_user_id">>, Data)},
-      {<<"approved_group_id">>, wh_json:get_value(<<"approved_group_id">>, Data)}
-    ],
+    SecureParams = [{<<"approved_device_id">>, wh_json:get_value(<<"approved_device_id">>, Data)}
+                    ,{<<"approved_user_id">>, wh_json:get_value(<<"approved_user_id">>, Data)}
+                    ,{<<"approved_group_id">>, wh_json:get_value(<<"approved_group_id">>, Data)}
+                   ],
     props:filter_undefined(SecureParams).
 
--spec maybe_allowed_to_intercept(whapps_call:call(), wh_proplist()) -> boolean().
-maybe_allowed_to_intercept(Call, Props) ->
-  Id = whapps_call:authorizing_id(Call),
-  case couch_mgr:open_cache_doc(whapps_call:account_db(Call), Id) of
-      {'ok', DeviceDoc} ->
-          Caller = wh_json:get_value(<<"owner_id">>, DeviceDoc),
-          case wh_json:get_value(<<"user_id">>, Props) of
-              'undefined' ->
-                  case wh_json:get_value(<<"device_id">>, Props) of
-                      'undefined' -> 'false';
-                      DevId ->
-                          case couch_mgr:open_cache_doc(whapps_call:account_db(Call), DevId) of
-                              {ok, Target} ->
-                                  Caller =:= wh_json:get_value(<<"owner_id">>, Target);
-                              Err ->
-                                  lager:info("Error while opening couch document: ~p", [Err]),
-                                  'false'
-                          end
-                  end;
-              UserId ->
-                  UserId =:= Caller
-          end;
-      Err ->
-          lager:info("Error while opening couch document: ~p", [Err]),
-          'false'
-  end.
-
 -spec build_intercept_params(ne_binary(), ne_binary(), whapps_call:call()) ->
-                                 {'ok', wh_proplist()} |
-                                 {'error', ne_binary()}.
+                                    {'ok', wh_proplist()} |
+                                    {'error', ne_binary()}.
 build_intercept_params(Number, <<"device">>, Call) ->
     AccountDb = whapps_call:account_db(Call),
     case cf_util:endpoint_id_by_sip_username(AccountDb, Number) of
@@ -156,9 +128,3 @@ params_from_data('undefined', _, _) ->
     {'error',<<"module not defined in callflow">>};
 params_from_data(Other, _, _) ->
     {'error',<<"module ",Other/binary," not implemented">>}.
-
--spec no_permission_to_intercept(whapps_call:call()) -> any().
-%% TODO: please convert to system_media file (say is not consistent on deployments)
-no_permission_to_intercept(Call) ->
-    whapps_call_command:answer(Call),
-    whapps_call_command:b_say(<<"you have no permission to intercept this call">>, Call).

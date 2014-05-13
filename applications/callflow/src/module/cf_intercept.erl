@@ -24,7 +24,10 @@
 
 -include("../callflow.hrl").
 
--export([handle/2]).
+-export([handle/2
+         ,maybe_allowed_to_intercept/2
+         ,play_no_permission_to_intercept/1
+        ]).
 
 %%--------------------------------------------------------------------
 %% @public
@@ -35,75 +38,82 @@
 %%--------------------------------------------------------------------
 -spec handle(wh_json:object(), whapps_call:call()) -> any().
 handle(Data, Call) ->
-    _ = case maybe_allowed_to_intercept(Data, Call) of
-            {ok, 'true'} ->
-                continue(Data, Call);
-            {'ok', 'false'} -> no_permission_to_intercept(Call);
+    _ = case maybe_approved_to_intercept(Data, Call) of
+            {'ok', 'true'} -> continue(Data, Call);
+            {'ok', 'false'} -> play_no_permission_to_intercept(Call);
             {'error', 'not_found'} ->
-                case maybe_same_user(Data, Call) orelse maybe_same_group(Data, Call) of
+                case maybe_allowed_to_intercept(Call, Data)
+                    orelse maybe_same_group(Data, Call)
+                of
                     'true' -> continue(Data, Call);
-                    'false' -> no_permission_to_intercept(Call)
+                    'false' -> play_no_permission_to_intercept(Call)
                 end
         end,
     cf_exe:stop(Call).
 
--spec maybe_same_user(wh_json:object(), whapps_call:call()) -> boolean().
-maybe_same_user(Data, Call) ->
-    CallerDevice = whapps_call:authorizing_id(Call),
-    case couch_mgr:open_cache_doc(whapps_call:account_db(Call), CallerDevice) of
-        {'ok', DevDoc} ->
-            Caller = wh_json:get_value(<<"owner_id">>, DevDoc),
-            case wh_json:get_value(<<"user_id">>, Data) of
-                'undefined' ->
-                    case wh_json:get_value(<<"device_id">>, Data) of
-                        'undefined' ->
-                            'false';
-                        DevId ->
-                            case couch_mgr:open_cache_doc(whapps_call:account_db(Call), DevId) of
-                                {ok, Target} ->
-                                    Caller =:= wh_json:get_value(<<"owner_id">>, Target);
-                                Err ->
-                                    lager:debug("Error while opening couch document: ~p", [Err]),
-                                    'false'
-                            end
-                    end;
-                UserId ->
-                    UserId =:= Caller
+-spec maybe_allowed_to_intercept(whapps_call:call(), wh_proplist() | wh_json:object()) -> boolean().
+maybe_allowed_to_intercept(Call, Props) when is_list(Props) ->
+    Id = whapps_call:authorizing_id(Call),
+    case couch_mgr:open_cache_doc(whapps_call:account_db(Call), Id) of
+        {'ok', DeviceDoc} ->
+            check_user_for_intercept_permissions(Call, Props, DeviceDoc);
+        {'error', _E} ->
+            lager:info("error trying to get authorizing doc ~s: ~p", [Id, _E]),
+            'false'
+    end;
+maybe_allowed_to_intercept(Call, Data) ->
+    maybe_allowed_to_intercept(Call, wh_json:to_proplist(Data)).
+
+-spec check_user_for_intercept_permissions(whapps_call:call(), wh_proplist(), wh_json:object()) -> boolean().
+check_user_for_intercept_permissions(Call, Props, DeviceDoc) ->
+    case wh_json:get_value(<<"user_id">>, Props) of
+        'undefined' -> check_device_for_intercept_permissions(Call, Props, DeviceDoc);
+        UserId -> UserId =:= wh_json:get_value(<<"owner_id">>, DeviceDoc)
+    end.
+
+-spec check_device_for_intercept_permissions(whapps_call:call(), wh_proplist(), wh_json:object()) -> boolean().
+check_device_for_intercept_permissions(Call, Props, DeviceDoc) ->
+    case wh_json:get_value(<<"device_id">>, Props) of
+        'undefined' -> 'false';
+        DevId ->
+            case couch_mgr:open_cache_doc(whapps_call:account_db(Call), DevId) of
+                {'ok', TargetDeviceDoc} ->
+                    wh_json:get_value(<<"owner_id">>, DeviceDoc) =:=
+                        wh_json:get_value(<<"owner_id">>, TargetDeviceDoc);
+                {'error', _E} ->
+                    lager:info("error trying to get target device ~s: ~p", [DevId, _E]),
+                    'false'
+            end
+    end.
+
+-spec maybe_same_group(wh_json:object(), whapps_call:call()) -> boolean().
+maybe_same_group(Data, Call) ->
+    case couch_mgr:open_cache_doc(whapps_call:account_db(Call), whapps_call:authorizing_id(Call)) of
+        {'ok', DeviceDoc} ->
+            case wh_json:get_value(<<"group_id">>, Data) of
+                'undefined' -> 'false';
+                GroupId -> maybe_same_group(Call, DeviceDoc, GroupId)
             end;
         Err ->
             lager:debug("Error while opening couch document: ~p", [Err]),
             'false'
     end.
 
--spec maybe_same_group(wh_json:object(), whapps_call:call()) -> boolean().
-maybe_same_group(Data, Call) ->
-    CallerDevice = whapps_call:authorizing_id(Call),
-    Acc = whapps_call:account_db(Call),
-    case couch_mgr:open_cache_doc(Acc, CallerDevice) of
-        {'ok', DevDoc} ->
-            Caller = wh_json:get_value(<<"owner_id">>, DevDoc),
-            case wh_json:get_value(<<"group_id">>, Data) of
-                'undefined' ->
-                    'false';
-                GroupId ->
-                    case couch_mgr:open_cache_doc(Acc, GroupId) of
-                        {'ok', GroupDoc} ->
-                            Endpoints = wh_json:get_ne_value(<<"endpoints">>, GroupDoc, []),
-                            lists:any(fun({Key, Descr}) ->
-                                case wh_json:get_value(<<"type">>, Descr) of
-                                    <<"device">> ->
-                                        Key =:= CallerDevice;
-                                    <<"user">> ->
-                                        Key =:= Caller;
-                                    Point ->
-                                        'false'
-                                end
-                            end, wh_json:to_proplist(Endpoints));
-                        Err ->
-                            lager:debug("Error while opening couch document: ~p", [Err]),
-                            'false'
-                    end
-            end;
+-spec maybe_same_group(whapps_call:call(), wh_json:object(), ne_binary()) -> boolean().
+maybe_same_group(Call, DeviceDoc, GroupId) ->
+    case couch_mgr:open_cache_doc(whapps_call:account_db(Call), GroupId) of
+        {'ok', GroupDoc} ->
+            Endpoints = wh_json:get_ne_value(<<"endpoints">>, GroupDoc, []),
+            lists:any(fun({Key, Descr}) ->
+                              case wh_json:get_value(<<"type">>, Descr) of
+                                  <<"device">> ->
+                                      Key =:= whapps_call:authorizing_id(Call);
+                                  <<"user">> ->
+                                      Key =:= wh_json:get_value(<<"owner_id">>, DeviceDoc);
+                                  _Point ->
+                                      'false'
+                              end
+                      end, wh_json:to_proplist(Endpoints));
         Err ->
             lager:debug("Error while opening couch document: ~p", [Err]),
             'false'
@@ -111,13 +121,15 @@ maybe_same_group(Data, Call) ->
 
 -spec continue(wh_json:object(), whapps_call:call()) -> any().
 continue(Data, Call) ->
-  case find_sip_endpoints(Data, Call) of
-    [] -> no_users(Call);
-    Usernames -> connect_to_channel(Usernames, Call)
-  end.
+    case find_sip_endpoints(Data, Call) of
+        [] -> no_users(Call);
+        Usernames -> connect_to_channel(Usernames, Call)
+    end.
 
--spec maybe_allowed_to_intercept(wh_json:object(), whapps_call:call()) -> {'ok', boolean()} | {'error', 'not_found'}.
-maybe_allowed_to_intercept(Data, Call) ->
+-spec maybe_approved_to_intercept(wh_json:object(), whapps_call:call()) ->
+                                         {'ok', boolean()} |
+                                         {'error', 'not_found'}.
+maybe_approved_to_intercept(Data, Call) ->
     case wh_json:get_value(<<"approved_device_id">>, Data) of
         'undefined' ->
             case wh_json:get_value(<<"approved_user_id">>, Data) of
@@ -135,34 +147,33 @@ maybe_allowed_to_intercept(Data, Call) ->
 
 -spec maybe_belongs_to_group(ne_binary(), whapps_call:call()) -> boolean().
 maybe_belongs_to_group(GroupId, Call) ->
-  is_in_list(whapps_call:authorizing_id(Call), find_group_endpoints(GroupId, Call)).
+    lists:member(whapps_call:authorizing_id(Call), find_group_endpoints(GroupId, Call)).
 
 -spec find_group_endpoints(ne_binary(), whapps_call:call()) -> ne_binaries().
 find_group_endpoints(GroupId, Call) ->
-  GroupsJObj = cf_attributes:groups(Call),
-  case [wh_json:get_value(<<"value">>, JObj)
-    || JObj <- GroupsJObj,
-    wh_json:get_value(<<"id">>, JObj) =:= GroupId
-  ]
-  of
-    [] -> [];
-    [GroupEndpoints] ->
-      Ids = wh_json:get_keys(GroupEndpoints),
-      find_endpoints(Ids, GroupEndpoints, Call)
-  end.
+    case [wh_json:get_value(<<"value">>, JObj)
+          || JObj <- cf_attributes:groups(Call),
+             wh_json:get_value(<<"id">>, JObj) =:= GroupId
+         ]
+    of
+        [] -> [];
+        [GroupEndpoints] ->
+            Ids = wh_json:get_keys(GroupEndpoints),
+            find_endpoints(Ids, GroupEndpoints, Call)
+    end.
 
 -spec find_endpoints(ne_binaries(), wh_json:object(), whapps_call:call()) ->
-  ne_binaries().
+                            ne_binaries().
 find_endpoints(Ids, GroupEndpoints, Call) ->
-  {DeviceIds, UserIds} =
-    lists:partition(fun(Id) ->
-      wh_json:get_value([Id, <<"type">>], GroupEndpoints) =:= <<"device">>
-    end, Ids),
-  find_user_endpoints(UserIds, lists:sort(DeviceIds), Call).
+    {DeviceIds, UserIds} =
+        lists:partition(fun(Id) ->
+                                wh_json:get_value([Id, <<"type">>], GroupEndpoints) =:= <<"device">>
+                        end, Ids),
+    find_user_endpoints(UserIds, lists:sort(DeviceIds), Call).
 
 -spec maybe_belongs_to_user(ne_binary(), whapps_call:call()) -> boolean().
 maybe_belongs_to_user(UserId, Call) ->
-    is_in_list(whapps_call:authorizing_id(Call), find_user_endpoints([UserId],[],Call)).
+    lists:member(whapps_call:authorizing_id(Call), find_user_endpoints([UserId], [], Call)).
 
 -spec connect_to_channel(ne_binaries(), whapps_call:call()) -> 'ok'.
 connect_to_channel(Usernames, Call) ->
@@ -204,10 +215,10 @@ sort_channels([Channel|Channels], MyUUID, MyMediaServer, Acc) ->
                                                         ,wh_json:get_value(<<"node">>, Channel)
                                                         ,wh_json:get_value(<<"other_leg">>, Channel)
                                                        ]),
-            maybe_add_leg(Channels, MyUUID, MyMediaServer, Acc, Channel).
+    maybe_add_leg(Channels, MyUUID, MyMediaServer, Acc, Channel).
 
 -spec maybe_add_leg(wh_json:objects(), ne_binary(), ne_binary(), {ne_binaries(), ne_binaries()}, wh_json:object()) ->
-                                      {ne_binaries(), ne_binaries()}.
+                           {ne_binaries(), ne_binaries()}.
 maybe_add_leg(Channels, MyUUID, MyMediaServer, {Local, Remote}=Acc, Channel) ->
     case wh_json:get_value(<<"node">>, Channel) of
         MyMediaServer ->
@@ -249,9 +260,8 @@ intercept_cmd(TargetCallId) ->
     ].
 
 -spec wait_for_intercept(whapps_call:call()) ->
-                             'ok' |
-                             {'error', 'failed'} |
-                             {'error', 'timeout'}.
+                                'ok' |
+                                {'error', 'timeout'}.
 wait_for_intercept(Call) ->
     case whapps_call_command:receive_event(10000) of
         {'ok', Evt} ->
@@ -262,8 +272,8 @@ wait_for_intercept(Call) ->
     end.
 
 -spec intercept_event(whapps_call:call(), {ne_binary(), ne_binary()}, wh_json:object()) ->
-                          {'error', 'failed' | 'timeout'} |
-                          'ok'.
+                             {'error', 'failed' | 'timeout'} |
+                             'ok'.
 intercept_event(_Call, {<<"error">>, <<"dialplan">>}, Evt) ->
     lager:debug("error in dialplan: ~s", [wh_json:get_value(<<"Error-Message">>, Evt)]),
     {'error', 'failed'};
@@ -306,7 +316,7 @@ find_sip_endpoints(Data, Call) ->
                      )
             end;
         DeviceId ->
-             sip_users_from_endpoints([DeviceId], Call)
+            sip_users_from_endpoints([DeviceId], Call)
     end.
 
 -spec find_sip_users(ne_binary(), whapps_call:call()) -> ne_binaries().
@@ -337,7 +347,6 @@ find_user_endpoints(UserIds, DeviceIds, Call) ->
     UserDeviceIds = cf_attributes:owned_by(UserIds, <<"device">>, Call),
     lists:merge(lists:sort(UserDeviceIds), DeviceIds).
 
-
 -spec no_users(whapps_call:call()) -> any().
 no_users(Call) ->
     whapps_call_command:answer(Call),
@@ -348,17 +357,7 @@ no_channels(Call) ->
     whapps_call_command:answer(Call),
     whapps_call_command:b_play(<<"system_media/pickup-no_channels">>, Call).
 
--spec no_permission_to_intercept(whapps_call:call()) -> any().
-%% TODO: please convert to system_media file (say is not consistent on deployments)
-no_permission_to_intercept(Call) ->
+-spec play_no_permission_to_intercept(whapps_call:call()) -> any().
+play_no_permission_to_intercept(Call) ->
     whapps_call_command:answer(Call),
-    whapps_call_command:b_say(<<"you have no permission to intercept this call">>, Call).
-
--spec is_in_list(api_binary(), ne_binaries()) -> boolean().
-%% NOTE: this could be replaced by list:member
-is_in_list(_, []) -> 'false';
-is_in_list(Suspect, [H|T]) ->
-    case Suspect == H of
-        'true' -> 'true';
-        _ -> is_in_list(Suspect, T)
-    end.
+    whapps_call_command:b_prompt(<<"intercept-no_permission">>, Call).
